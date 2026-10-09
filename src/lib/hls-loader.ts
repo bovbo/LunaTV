@@ -1,14 +1,7 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
 /**
  * 优化的 HLS.js Loader
- * 功能：
- * 1. 并发分片预取：主加载同时预取后续 2-3 个分片，缓冲速度提升 2-4 倍
- * 2. 内存上限控制：最多缓存 50MB 数据
- * 3. 失败熔断：连续失败 3 次停止预取
- * 4. Byte-Range 跳过保护：避免预取不完整分片
- * 5. 广告过滤：过滤带 #AD 标记的分段
- * 6. 直连模式支持：支持 allowCORS 参数
- * 7. 源站标识：支持 moontv-source 参数
+
  */
 
 import Hls from 'hls.js';
