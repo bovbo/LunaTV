@@ -313,17 +313,17 @@ function PlayPageClient() {
   // resize事件防抖管理
   const resizeResetTimeoutRef = useRef<NodeJS.Timeout | null>(null);
 
-  // 内容过滤开关（默认关闭，避免部署审核问题）
+  // 去广告开关（从 localStorage 继承，默认 true）
   const [blockAdEnabled, setBlockAdEnabled] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
       const v = localStorage.getItem('enable_blockad');
       if (v !== null) return v === 'true';
     }
-    return false; // 默认关闭
+    return true;
   });
   const blockAdEnabledRef = useRef(blockAdEnabled);
 
-  // 自定义过滤代码（已禁用）
+  // 自定义去广告代码
   const [customAdFilterCode, setCustomAdFilterCode] = useState<string>('');
   const [customAdFilterVersion, setCustomAdFilterVersion] = useState<number>(1);
   const customAdFilterCodeRef = useRef(customAdFilterCode);
@@ -735,8 +735,60 @@ function PlayPageClient() {
     return () => clearInterval(interval);
   }, []);
 
-  // 自定义过滤代码获取已禁用（避免部署审核问题）
-  // useEffect(() => { ... }, []);
+  // 获取自定义去广告代码
+  useEffect(() => {
+    const fetchAdFilterCode = async () => {
+      try {
+        // 从缓存读取去广告代码和版本号
+        const cachedCode = localStorage.getItem('customAdFilterCode');
+        const cachedVersion = localStorage.getItem('customAdFilterVersion');
+
+        if (cachedCode && cachedVersion) {
+          setCustomAdFilterCode(cachedCode);
+          setCustomAdFilterVersion(parseInt(cachedVersion));
+          console.log('使用缓存的去广告代码');
+        }
+
+        // 从 window.RUNTIME_CONFIG 获取版本号
+        const version = (window as any).RUNTIME_CONFIG?.CUSTOM_AD_FILTER_VERSION || 0;
+
+        // 如果版本号为 0，说明去广告未设置，清空缓存并跳过
+        if (version === 0) {
+          localStorage.removeItem('customAdFilterCode');
+          localStorage.removeItem('customAdFilterVersion');
+          setCustomAdFilterCode('');
+          setCustomAdFilterVersion(0);
+          return;
+        }
+
+        // 如果缓存版本号与服务器版本号不一致，获取最新代码
+        if (!cachedVersion || parseInt(cachedVersion) !== version) {
+          console.log('检测到去广告代码更新（版本 ' + version + '），获取最新代码');
+
+          // 获取完整代码
+          const fullResponse = await fetch('/api/ad-filter?full=true');
+          if (!fullResponse.ok) {
+            console.warn('获取完整去广告代码失败，使用缓存');
+            return;
+          }
+
+          const { code, version: newVersion } = await fullResponse.json();
+
+          // 更新缓存和状态
+          localStorage.setItem('customAdFilterCode', code || '');
+          localStorage.setItem('customAdFilterVersion', String(newVersion || 0));
+          setCustomAdFilterCode(code || '');
+          setCustomAdFilterVersion(newVersion || 0);
+
+          console.log('去广告代码已更新到版本 ' + newVersion);
+        }
+      } catch (error) {
+        console.error('获取自定义去广告代码失败:', error);
+      }
+    };
+
+    fetchAdFilterCode();
+  }, []);
 
   // WebGPU支持检测
   useEffect(() => {
@@ -2635,9 +2687,85 @@ function PlayPageClient() {
     }
   };
 
-  // 内容过滤函数（已禁用，直接返回原内容，避免部署审核问题）
+  // 去广告相关函数
   function filterAdsFromM3U8(m3u8Content: string): string {
-    return m3u8Content || '';
+    if (!m3u8Content) return '';
+
+    // 如果有自定义去广告代码，优先使用
+    const customCode = customAdFilterCodeRef.current;
+    if (customCode && customCode.trim()) {
+      try {
+        // 移除 TypeScript 类型注解,转换为纯 JavaScript
+        const jsCode = customCode
+          .replace(/(\w+)\s*:\s*(string|number|boolean|any|void|never|unknown|object)\s*([,)])/g, '$1$3')
+          .replace(/\)\s*:\s*(string|number|boolean|any|void|never|unknown|object)\s*\{/g, ') {')
+          .replace(/(const|let|var)\s+(\w+)\s*:\s*(string|number|boolean|any|void|never|unknown|object)\s*=/g, '$1 $2 =');
+
+        // 创建并执行自定义函数
+        // eslint-disable-next-line no-new-func
+        const customFunction = new Function('type', 'm3u8Content',
+          jsCode + '\nreturn filterAdsFromM3U8(type, m3u8Content);'
+        );
+        const result = customFunction(currentSourceRef.current, m3u8Content);
+        console.log('✅ 使用自定义去广告代码');
+        return result;
+      } catch (err) {
+        console.error('执行自定义去广告代码失败,降级使用默认规则:', err);
+        // 继续使用默认规则
+      }
+    }
+
+    // 默认去广告规则
+    if (!m3u8Content) return '';
+
+    // 广告关键字列表
+    const adKeywords = [
+      'sponsor',
+      '/ad/',
+      '/ads/',
+      'advert',
+      'advertisement',
+      '/adjump',
+      'redtraffic'
+    ];
+
+    // 按行分割M3U8内容
+    const lines = m3u8Content.split('\n');
+    const filteredLines = [];
+
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+
+      // 跳过 #EXT-X-DISCONTINUITY 标识
+      if (line.includes('#EXT-X-DISCONTINUITY')) {
+        i++;
+        continue;
+      }
+
+      // 如果是 EXTINF 行，检查下一行 URL 是否包含广告关键字
+      if (line.includes('#EXTINF:')) {
+        // 检查下一行 URL 是否包含广告关键字
+        if (i + 1 < lines.length) {
+          const nextLine = lines[i + 1];
+          const containsAdKeyword = adKeywords.some(keyword =>
+            nextLine.toLowerCase().includes(keyword.toLowerCase())
+          );
+
+          if (containsAdKeyword) {
+            // 跳过 EXTINF 行和 URL 行
+            i += 2;
+            continue;
+          }
+        }
+      }
+
+      // 保留当前行
+      filteredLines.push(line);
+      i++;
+    }
+
+    return filteredLines.join('\n');
   }
 
   const formatTime = (seconds: number): string => {
@@ -4363,16 +4491,21 @@ function PlayPageClient() {
                 },
               },
 
-              /* 优化的 HLS Loader：并发分片预取 */
-              loader: class extends OptimizedHlsLoader {
-                constructor(config: any) {
-                  super({
-                    ...config,
-                    enableDirectConnect: false,
-                    sourceKey: '',
-                  });
-                }
-              },
+              /* 优化的 HLS Loader：广告过滤 + 并发分片预取 */
+              loader: blockAdEnabledRef.current
+                ? class extends OptimizedHlsLoader {
+                    constructor(config: any) {
+                      super({
+                        ...config,
+                        filterAds: true,
+                        enableDirectConnect: false,
+                        sourceKey: '',
+                        customAdFilterCode: customAdFilterCodeRef.current,
+                        currentSource: currentSourceRef.current,
+                      });
+                    }
+                  }
+                : Hls.DefaultConfig.loader,
             });
 
             hls.loadSource(url);
@@ -4544,7 +4677,29 @@ function PlayPageClient() {
             '<img src="data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSI1MCIgaGVpZ2h0PSI1MCIgdmlld0JveD0iMCAwIDUwIDUwIj48cGF0aCBkPSJNMjUuMjUxIDYuNDYxYy0xMC4zMTggMC0xOC42ODMgOC4zNjUtMTguNjgzIDE4LjY4M2g0LjA2OGMwLTguMDcgNi41NDUtMTQuNjE1IDE0LjYxNS0xNC42MTVWNi40NjF6IiBmaWxsPSIjMDA5Njg4Ij48YW5pbWF0ZVRyYW5zZm9ybSBhdHRyaWJ1dGVOYW1lPSJ0cmFuc2Zvcm0iIGF0dHJpYnV0ZVR5cGU9IlhNTCIgZHVyPSIxcyIgZnJvbT0iMCAyNSAyNSIgcmVwZWF0Q291bnQ9ImluZGVmaW5pdGUiIHRvPSIzNjAgMjUgMjUiIHR5cGU9InJvdGF0ZSIvPjwvcGF0aD48L3N2Zz4=">',
         },
         settings: [
-          // 内容过滤开关已暂时移除（避免部署审核问题）
+          {
+            html: '去广告',
+            icon: '<text x="50%" y="50%" font-size="20" font-weight="bold" text-anchor="middle" dominant-baseline="middle" fill="#ffffff">AD</text>',
+            tooltip: blockAdEnabled ? '已开启' : '已关闭',
+            onClick() {
+              const newVal = !blockAdEnabled;
+              try {
+                localStorage.setItem('enable_blockad', String(newVal));
+                if (artPlayerRef.current) {
+                  resumeTimeRef.current = artPlayerRef.current.currentTime;
+                  if (artPlayerRef.current.video.hls) {
+                    artPlayerRef.current.video.hls.destroy();
+                  }
+                  artPlayerRef.current.destroy(false);
+                  artPlayerRef.current = null;
+                }
+                setBlockAdEnabled(newVal);
+              } catch (_) {
+                // ignore
+              }
+              return newVal ? '当前开启' : '当前关闭';
+            },
+          },
           {
             name: '外部弹幕',
             html: '外部弹幕',
